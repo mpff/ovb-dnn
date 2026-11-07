@@ -1,0 +1,25 @@
+name: ovb-dnn
+channels:
+  - conda-forge
+dependencies:
+  - python=3.13
+  - numpy
+  - scipy
+  - scikit-learn
+  - h5py
+  - pytest
+  - r-base
+  - r-dplyr
+  - r-tidyr
+  - r-readr
+  - r-ggplot2
+  - r-patchwork
+  - r-latex2exp
+  - r-mltools
+  - r-png
+  - r-tikzdevice
+  - pip
+  - pip:
+      - torch
+      - torchvision
+      - -e .

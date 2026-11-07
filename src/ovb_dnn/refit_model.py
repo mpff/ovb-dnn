@@ -1,0 +1,403 @@
+import torch
+import torch.nn as nn
+
+from ovb_dnn.model import BaseNetwork
+from ovb_dnn.transform import Center
+
+
+class RefitCovarNetwork(BaseNetwork):
+    """Refits a pretrained backbone's head as eta = intercept + f_X(X) + f_Z(Z) via ridge-penalized IRLS backfitting."""
+
+    def __init__(self, model, num_covariates, orthogonalize=False):
+        super().__init__(
+            backbone=model.backbone.__class__,
+            backbone_params=model.backbone_params,
+            num_covariates=num_covariates,
+            link=model.link
+        )
+        self.load_state_dict(model.state_dict())
+        self.num_covariates = num_covariates
+        self.orthogonalize = orthogonalize
+
+        # Covariate components.
+        self.center_z = Center(num_covariates)
+        self.fz = nn.Linear(num_covariates, 1, bias=False)
+        self.fz.weight.data.zero_()
+
+        # Optional orthogonalization on fx. (I - Z(Z'Z)^{-1}Z'X)
+        self.orth = nn.Linear(num_covariates, 1, bias=False)
+        self.orth.weight.data.zero_()
+
+        # Selected ridge penalty (set by _fit_effects). Buffer, not parameter —
+        # it's a hyperparameter, not a learnable.
+        self.register_buffer("lam", torch.tensor(0.0))
+
+    # -------------------------------------------------------------------------
+    # Forward & prediction methods
+    # -------------------------------------------------------------------------
+    def predict_eta(self, x, z):
+        """Linear predictor eta = intercept + f_X(x) + f_Z(z), before the link."""
+        return self.intercept + self.predict_fx(x, z) + self.predict_fz(z)
+
+    def forward(self, x, z):
+        eta = self.predict_eta(x, z)
+        return self.output_func(eta)
+
+    def predict_fx(self, x, z=None):
+        """Feature contribution, optionally orthogonalized against Z."""
+        x = self.backbone(x)
+        x = self.center_x(x)
+        fx = self.fx(x)
+        if self.orthogonalize:
+            z = self.center_z(z)
+            fx -= self.orth(z)
+        return fx
+
+    def predict_fz(self, z):
+        """Covariate contribution, optionally corrected for orthogonalization."""
+        z = self.center_z(z)
+        fz = self.fz(z)
+        if self.orthogonalize:
+            fz += self.orth(z)
+        return fz
+
+    # -------------------------------------------------------------------------
+    # Fitting methods
+    # -------------------------------------------------------------------------
+    def fit(self, train_dataloader, val_dataloader, lam=None, max_iters=50, tol=1e-2, penalty_z=None, n_lambdas=100):
+        """Fit centering, the ridge/IRLS effects, and (optionally) the orthogonalization term."""
+        # penalty_z (num_covariates x num_covariates), e.g. a P-spline roughness
+        # penalty, must be built on the standardized Z scale for _fit_effects;
+        # _fit_orthogonalization applies it on the centered (unstandardized) scale.
+        self.center_effects(train_dataloader)
+        self._fit_effects(train_dataloader, val_dataloader, lam=lam, max_iters=max_iters, tol=tol, penalty_z=penalty_z, n_lambdas=n_lambdas)
+        if self.orthogonalize:
+            self._fit_orthogonalization(train_dataloader, penalty_z=penalty_z)
+        return self
+    
+    @torch.no_grad()
+    def center_effects(self, dataloader):
+        """Fit centering means on `dataloader`; the intercept is refit by IRLS on the same sample."""
+        self._fit_centers_from_loader(dataloader)
+        self.is_centered.fill_(True)
+        return self
+
+    @torch.no_grad()
+    def recenter(self, loader):
+        """Re-express f_X, f_Z relative to `loader`'s sample means; eta is unchanged for every input."""
+        # The intercept shift compensates the new centers exactly, for any
+        # link: eta is linear in the centered features, and the link never
+        # enters eta's own definition.
+        X, Z, _ = self._extract_features_from_loader(loader)
+        cx_new = X.mean(dim=0)
+        cz_new = Z.mean(dim=0)
+        bX = self.fx.weight.data.flatten()
+        bZ = self.fz.weight.data.flatten()
+
+        self.intercept.data += (cx_new - self.center_x.mean) @ bX + (cz_new - self.center_z.mean) @ bZ
+        self.center_x.mean.copy_(cx_new)
+        self.center_z.mean.copy_(cz_new)
+        return self
+
+    # -------------------------------------------------------------------------
+    # Internal methods
+    # -------------------------------------------------------------------------
+    @torch.no_grad()
+    def _fit_effects(self, train_loader, val_loader,
+        lam, max_iters, tol, n_lambdas=100, max_expansions=6, penalty_z=None):
+
+        self.max_iters_ = max_iters
+        self.tol_ = tol
+        self.n_lambdas_ = n_lambdas
+
+        # ---- Extract training data ----
+        X_train, Z_train, y_train = self._extract_features_from_loader(train_loader)
+        X_train = self.center_x(X_train)
+        Z_train = self.center_z(Z_train)
+
+        # Clamped: a constant (dead) feature column has exactly zero std;
+        # dividing by the clamp keeps it exactly zero, so it draws a zero
+        # ridge coefficient instead of poisoning every solve with NaN.
+        X_std = X_train.std(dim=0, keepdim=True).clamp_min(1e-6)
+        Z_std = Z_train.std(dim=0, keepdim=True).clamp_min(1e-6)
+
+        X_train = X_train / X_std
+        Z_train = Z_train / Z_std
+
+        # ---- Extract validation data ----
+        X_val, Z_val, y_val = self._extract_features_from_loader(val_loader)
+        X_val = self.center_x(X_val)
+        Z_val = self.center_z(Z_val)
+
+        # ---- Build lambda path ---- (see glmnet paper)
+        lambda_max = self._get_lambda_max(X_train, y_train)
+        if X_train.shape[0] < X_train.shape[1]:
+            lambda_min = 1e-3 * lambda_max  # More aggressive regularization for high-dimensional case.
+        else:
+            lambda_min = 1e-6 * lambda_max  # Default glmnet choice for low-dimensional case.
+
+        records = []
+
+        for expansion_idx in range(max_expansions):
+
+            lambda_path = torch.logspace(
+                torch.log10(lambda_max),
+                torch.log10(lambda_min),
+                steps=n_lambdas,
+                device=X_train.device,
+            )
+            if lam is not None:
+                lambda_path = torch.tensor([lam], device=X_train.device)
+            else:
+                print("Lambda max: {:.4e}, Lambda min: {:.4e}".format(lambda_max.item(), lambda_min.item()))
+
+            # ---- Initialize parameters ----
+            self.fx.weight.data.zero_()
+            self.fz.weight.data.zero_()
+            self.intercept.data = self._link.forward(self.center_y.mean).view(1)  # mean defined as shape (1,)!
+
+            best_val_loss = float("inf")
+            best_val_loss_any = float("inf")  # fallback: best val loss ignoring convergence
+            best_state = None
+            best_state_any = None
+            best_lambda = None
+            best_lambda_any = None
+
+            for lambd in lambda_path:
+
+                # ---- Train at fixed λ ----
+                # A λ small enough to vanish against a collinear Gram matrix in
+                # float32 has no computable ridge solution: mark it failed on
+                # the path (never selectable), like any non-converged fit.
+                try:
+                    diag = self._solve_fixed_lambda(
+                        X_train,
+                        Z_train,
+                        y_train,
+                        lambd,
+                        max_iters,
+                        tol,
+                        penalty_z=penalty_z,
+                    )
+                except torch.linalg.LinAlgError:
+                    records.append({
+                        "expansion":    expansion_idx,
+                        "lambda":       float(lambd),
+                        "val_loss":     float("inf"),
+                        "converged":    False,
+                        "solve_failed": True,
+                    })
+                    self.fx.weight.data.zero_()
+                    self.fz.weight.data.zero_()
+                    self.intercept.data = self._link.forward(self.center_y.mean).view(1)
+                    continue
+                # Update fx/fz weights to account for X/Z standardization.
+                self.fx.weight.data /= X_std
+                self.fz.weight.data /= Z_std
+
+                beta_fx_norm = float(self.fx.weight.data.norm())
+                beta_fz_norm = float(self.fz.weight.data.norm())
+
+                # ---- Validation evaluation ----
+                eta_val = self.intercept + self.fx(X_val) + self.fz(Z_val)
+
+                # Use loss function corresponding to the link function for validation evaluation.
+                if self.link == "identity":
+                    val_loss = torch.nn.MSELoss()(eta_val, y_val)
+                elif self.link == "logit":
+                    val_loss = torch.nn.BCEWithLogitsLoss()(eta_val, y_val)
+                else:
+                    raise ValueError(f"Unsupported link function: {self.link}")
+
+                records.append({
+                    "expansion":    expansion_idx,
+                    "lambda":       float(lambd),
+                    "val_loss":     float(val_loss),
+                    "converged":    diag["converged"],
+                    "n_iters":      diag["n_iters"],
+                    "delta_fx":     diag["delta_fx"],
+                    "delta_fz":     diag["delta_fz"],
+                    "beta_fx_norm": beta_fx_norm,
+                    "beta_fz_norm": beta_fz_norm,
+                })
+
+                if val_loss < best_val_loss and diag["converged"] == True:
+                    best_val_loss = val_loss
+                    best_lambda = lambd
+                    best_state = {
+                        "fx": self.fx.weight.data.clone(),
+                        "fz": self.fz.weight.data.clone(),
+                        "intercept": self.intercept.data.clone(),
+                    }
+
+                # Unconditional fallback — used if no lambda converges.
+                if val_loss < best_val_loss_any:
+                    best_val_loss_any = val_loss
+                    best_lambda_any = lambd
+                    best_state_any = {
+                        "fx": self.fx.weight.data.clone(),
+                        "fz": self.fz.weight.data.clone(),
+                        "intercept": self.intercept.data.clone(),
+                    }
+
+                self.fx.weight.data.zero_()
+                self.fz.weight.data.zero_()
+                self.intercept.data = self._link.forward(self.center_y.mean).view(1)  # mean defined as shape (1,)!
+
+            # If no lambda converged, fall back to best unconverged state.
+            if best_state is None:
+                print("Warning: no converged solution found across lambda path — using best unconverged state.")
+                best_state = best_state_any
+                best_lambda = best_lambda_any
+            if best_state is None:
+                raise RuntimeError("No lambda on the path was solvable — every ridge solve failed.")
+
+            # check if best lambda is at the edge of the path, if so expand the path and repeat.
+            if len(lambda_path) == 1:
+                break
+            if best_lambda == lambda_path[0]:
+                lambda_min = lambda_max + 1e-4 * lambda_max
+                lambda_max *= 100
+                print("Expanding lambda path: new lambda max = {:.4e}".format(lambda_max.item()))
+            elif best_lambda == lambda_path[-1]:
+                lambda_max = lambda_min - 1e-4 * lambda_min
+                lambda_min /= 100
+                print("Expanding lambda path: new lambda min = {:.4e}".format(lambda_min.item()))
+            else:
+                break
+
+        # ---- Restore best model ----
+        self.fx.weight.data.copy_(best_state["fx"])
+        self.fz.weight.data.copy_(best_state["fz"])
+        self.intercept.data.copy_(best_state["intercept"])
+
+        self.lam.copy_(best_lambda)
+        self.lambda_path_ = records
+        print("Best lambda: {:.4e}".format(best_lambda.item()))
+
+        return self
+
+    @torch.no_grad()
+    def _get_lambda_max(self, X, y):
+        """Compute lambda_max for the ridge path (glmnet convention)."""
+        # N * alpha * lambda_max = max_j |X_j'y| with centered X and y;
+        # glmnet uses alpha = 0.001 in the ridge case.
+        N = X.shape[0]
+        y = self.center_y(y)
+        alpha = 0.001
+        lambda_max = torch.max(torch.abs(X.T @ y)) / N / alpha
+        return lambda_max
+
+    @torch.no_grad()
+    def _solve_fixed_lambda(self, X, Z, y, lam, max_iters, tol, penalty_z=None):
+
+        eps = 1e-5  # Small constant for numerical stability.
+
+        delta_fx = 0.0
+        delta_fz = 0.0
+        converged = False
+
+        # Penalty matrix in centered Z scale (fixed across IRLS iterations).
+        P_z = penalty_z.to(X.device) if penalty_z is not None \
+            else torch.zeros(Z.shape[1], Z.shape[1], device=X.device)
+
+        # Iteratively reweighted least squares until convergence.
+        for i in range(max_iters):
+
+            # ---- Track fitted values before update (for convergence criterion) ----
+            eta_fx_old = self.fx(X).clone()
+            eta_fz_old = self.fz(Z).clone()
+
+            # ---- Prepare reweighted data ----
+
+            eta = self.intercept + self.fx(X) + self.fz(Z)
+            mu = self._link.inverse(eta)
+            var = self._link.variance(mu)
+            g_prime = self._link.derivative(mu)
+            weights = g_prime**2 / (var + eps)
+
+            # Clip probabilities for numerical stability in binomial case.
+            if self.link == "logit":
+                close_to_zero = mu < eps
+                close_to_one = mu > 1 - eps
+                mu = torch.where(close_to_zero, torch.zeros_like(mu), mu)
+                mu = torch.where(close_to_one,  torch.ones_like(mu),  mu)
+                weights = torch.where(close_to_zero | close_to_one,
+                                      torch.full_like(weights, eps), weights)
+            sqrt_weights = torch.sqrt(weights)
+
+            y_work = eta + (y - mu) / (g_prime + eps)
+
+            # Centered reweighting. (Note: not equal to demeaning in case of weights!)
+            yw = sqrt_weights * (y_work - (weights * y_work).sum() / weights.sum())
+            Xw = sqrt_weights * (X - (weights * X).sum(dim=0, keepdim=True) / weights.sum())
+            Zw = sqrt_weights * (Z - (weights * Z).sum(dim=0, keepdim=True) / weights.sum())
+
+            # --- Fitting Procedure ---
+
+            # 1. Regress yw on Zw to get residuals.
+            resid_y = yw - Zw @ torch.linalg.solve(Zw.T @ Zw + P_z, Zw.T @ yw)
+
+            # 2. Regress Xw on Zw to get residuals.
+            resid_X = Xw - Zw @ torch.linalg.solve(Zw.T @ Zw + P_z, Zw.T @ Xw)
+
+            # Profiling beta_fz out gives (Xw' M Xw + lam I)^{-1} Xw' M yw with
+            # M = I - Zw (Zw'Zw + P_z)^{-1} Zw', which is not idempotent for P_z != 0.
+            beta_fx = torch.linalg.solve(
+                Xw.T @ resid_X + lam * torch.eye(resid_X.shape[1]).to(resid_X.device),
+                Xw.T @ resid_y
+            )
+            self.fx.weight.data.copy_(beta_fx.view(1, -1))
+
+            # 4. Compute fz weights.
+            resid_y_new = yw - self.fx(Xw)
+            beta_fz = torch.linalg.solve(Zw.T @ Zw + P_z, Zw.T @ resid_y_new)
+            # Update fz weights (excluding intercept).
+            self.fz.weight.data.copy_(beta_fz.view(1, -1))
+
+            # X, Z are centred by unweighted means, so the WLS intercept is
+            # beta_0 = sum_i w_i (y*_i - f_X(x_i) - f_Z(z_i)) / sum_i w_i.
+            self.intercept.data = ((weights * (y_work - self.fx(X) - self.fz(Z))).sum() / weights.sum()).view(1)
+
+            # 5. Check convergence via relative change in fitted values (linear predictor).
+            # mgcv-style: mean|Δη_fx| / (mean|η_fx_old| + 0.1). The 0.1 offset prevents
+            # blow-up when fx ≈ 0 (the pathological case for coefficient-change criteria).
+            if self.link == "identity":
+                converged = True
+                break  # No need for IRLS iterations for identity link
+            delta_fx = (self.fx(X) - eta_fx_old).abs().mean() / (eta_fx_old.abs().mean() + 0.1)
+            delta_fz = (self.fz(Z) - eta_fz_old).abs().mean() / (eta_fz_old.abs().mean() + 0.1)
+            if delta_fx < tol and delta_fz < tol:
+                converged = True
+                break
+            if i == max_iters - 1:
+                print(f"IRLS did not converge after {max_iters} iterations (delta_fx={delta_fx:.4e}, delta_fz={delta_fz:.4e}, lambda={lam:.4e}). Consider increasing max_iters or tol.")
+
+        return {
+            "converged": converged,
+            "n_iters":   i + 1,
+            "delta_fx":  float(delta_fx),
+            "delta_fz":  float(delta_fz),
+        }
+        
+    @torch.no_grad()
+    def _fit_orthogonalization(self, dataloader, penalty_z=None):
+        """Fit linear orthogonalization term via least squares on (Z, fX).
+        penalty_z is on the centered Z scale (no Z_std correction needed here since
+        orthogonalization operates directly on center_z(Z), not standardised Z).
+        """
+        self.eval()
+        X, Z, _ = self._extract_features_from_loader(dataloader)
+
+        X = self.center_x(X)
+        Z = self.center_z(Z)
+        fX = self.fx(X)
+
+        P = penalty_z.to(Z.device) if penalty_z is not None \
+            else torch.zeros(Z.shape[1], Z.shape[1], device=Z.device)
+        # min-norm lstsq on cpu: a rank-deficient Z'Z (e.g. collinear basis
+        # columns) must not fail, and CUDA lstsq assumes full rank
+        solution = torch.linalg.lstsq((Z.T @ Z + P).cpu(), (Z.T @ fX).cpu(),
+                                      driver="gelsd").solution.to(Z.device)
+        self.orth.weight.copy_(solution.T)
+        return self
